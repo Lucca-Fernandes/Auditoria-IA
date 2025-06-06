@@ -7,7 +7,7 @@ audit_report.log
 audit_report.out
 audit_report.pdf
 audit_report.tex
-audit_report.tex~
+audit_report.tex.tex
 audit_report.toc
 auditoria_aula.py~
 backup_2.py
