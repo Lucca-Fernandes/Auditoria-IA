@@ -1,476 +1,703 @@
-import cv2
-import os
 import whisper
-import librosa
+import cv2
 import numpy as np
-import spacy
-from sklearn.ensemble import RandomForestClassifier
-from transformers import pipeline
-from sentence_transformers import SentenceTransformer, util
-import torch
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from datetime import datetime
+from pylatex import Document, Section, Subsection, Command
+from pylatex.utils import NoEscape
+import requests
+import time
+import re
+import unicodedata
+import os
+import nltk
+from nltk.tokenize import sent_tokenize
+import subprocess
+import datetime
+import json
+from flask import Flask, request, send_file, jsonify, make_response
+from werkzeug.utils import secure_filename
 
-# Carregar modelos
-nlp = spacy.load("pt_core_news_sm")
-sentence_model = SentenceTransformer('neuralmind/bert-base-portuguese-cased')
-sentiment_analyzer = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
+# Download necessário para NLTK
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
+    if not nltk.data.find('tokenizers/punkt_tab'):
+        raise Exception("Recurso punkt_tab não encontrado após download.")
+except Exception as e:
+    print(f"Erro ao baixar recursos do NLTK: {str(e)}. Continuando sem tokenização avançada.")
 
-# Função para limpar arquivos temporários
-def clean_temp_files():
-    temp_files = ["temp_audio.wav"]
-    for file in temp_files:
-        if os.path.exists(file):
-            os.remove(file)
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
 
-# Função para extrair áudio do vídeo
-def extract_audio(video_path, audio_path="temp_audio.wav"):
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Vídeo não encontrado: {video_path}")
-    if os.path.exists(audio_path):
-        os.remove(audio_path)
-    os.system(f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 44100 -ac 2 {audio_path}")
-    return audio_path
+# Configurações
+APPROVAL_THRESHOLD = 60
+MODEL_WHISPER = "tiny"
+API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+API_KEY = "AIzaSyCzZgOEtBMbws6AKcYmmsfLDMbP8MRL9nA"  
+MONDAY_API_URL = "https://api.monday.com/v2"
+MONDAY_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUyMjgzNTYwNSwiYWFpIjoxMSwidWlkIjo3Njg3MjI4MSwiaWFkIjoiMjAyNS0wNi0wNVQyMzozMjowMy4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6Mjk4NTQ1MjcsInJnbiI6InVzZTEifQ.WoKfXLkChx1AU16TafgaTOXALV2vO3T1sDh-I7JkSjg"
+MONDAY_BOARD_ID = "9308063155" 
+MONDAY_FILES_COLUMN_ID = "file_mkrmt6km" 
 
-# Função para transcrever áudio
-def transcribe_audio(audio_path):
-    model = whisper.load_model("base")
-    result = model.transcribe(audio_path, language="pt")
-    return result["text"]
+def transcribe_audio(video_path):
+    try:
+        print("Carregando modelo Whisper...")
+        model = whisper.load_model(MODEL_WHISPER)
+        audio_file = "temp_audio.wav"
+        
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Vídeo não encontrado: {video_path}")
+        print("Extraindo áudio com FFmpeg...")
+        os.system(f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 44100 -ac 2 {audio_file}")
+        
+        print("Transcrevendo áudio...")
+        result = model.transcribe(audio_file, language="pt")
+        transcription = result["text"]
+        print(f"Transcrição completa: {transcription}")
+        
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
+        return transcription
+    except Exception as e:
+        print(f"Erro na transcrição: {str(e)}")
+        return ""
 
-# Função para extrair características de áudio
-def extract_audio_features(audio_path):
-    y, sr = librosa.load(audio_path)
-    energy = librosa.feature.rms(y=y)[0]
-    energy_std = np.std(energy)
-    silence = librosa.effects.split(y, top_db=20)
-    total_duration = len(y) / sr
-    pause_duration = sum((end - start) / sr for start, end in silence if (end - start) / sr > 1.0)
-    pause_ratio = pause_duration / total_duration if total_duration > 0 else 0
-    return [energy_std, pause_ratio]
-
-# Função para extrair características de texto
-def extract_text_features(transcription, theme):
-    doc = nlp(transcription)
-    sentences = list(doc.sents)
-    avg_sent_length = np.mean([len(sent) for sent in sentences]) if sentences else 0
-    
-    # Insegurança
-    insecurity_words = ["erro", "ops", "desculpe", "não sei", "deixa eu corrigir", "não está funcionando", "vou tentar de novo", "deu erro", "não compila"]
-    insecurity_count = sum(1 for token in doc if token.text.lower() in insecurity_words)
-    total_words = len(doc)
-    insecurity_ratio = insecurity_count / total_words if total_words > 0 else 0
-    
-    # Conhecimento técnico
-    technical_words = ["programação", "variável", "função", "algoritmo", "código", "projeto", "dados", "sistema", "loop", "condicional", "debug", "classe", "método"]
-    technical_count = sum(1 for token in doc if token.text.lower() in technical_words)
-    technical_density = technical_count / total_words if total_words > 0 else 0
-    
-    # Contexto técnico negativo (ajustado por tema)
-    negative_technical_phrases = ["deu erro", "não funciona", "está errado", "vou refazer"]
-    negative_technical_count = sum(1 for sent in sentences if any(phrase in sent.text.lower() for phrase in negative_technical_phrases))
-    negative_technical_ratio = negative_technical_count / len(sentences) if sentences else 0
-    if theme == "tratamento de erros":
-        negative_technical_ratio *= 0.1  # Reduzir impacto em aulas de tratamento de erros
-    
-    # Didática
-    didactic_phrases = ["por exemplo", "em resumo", "passo a passo", "vamos aprender", "como funciona", "vou explicar"]
-    didactic_count = sum(1 for sent in sentences if any(phrase in sent.text.lower() for phrase in didactic_phrases))
-    didactic_ratio = didactic_count / len(sentences) if sentences else 0
-    
-    # Interatividade
-    interactivity_phrases = ["alguma dúvida", "o que acham", "vamos juntos", "pergunta", "entenderam"]
-    interactivity_count = sum(1 for sent in sentences if "?" in sent.text or any(phrase in sent.text.lower() for phrase in interactivity_phrases))
-    interactivity_ratio = interactivity_count / len(sentences) if sentences else 0
-    
-    # Coerência
-    if len(sentences) > 1:
-        embeddings = sentence_model.encode([sent.text for sent in sentences], convert_to_tensor=True)
-        similarities = [util.pytorch_cos_sim(embeddings[i], embeddings[i + 1]).item() for i in range(len(embeddings) - 1)]
-        coherence_score = np.mean(similarities) if similarities else 0
-    else:
-        coherence_score = 0
-    
-    # Repetição no discurso
-    words = [token.text.lower() for token in doc]
-    word_counts = {}
-    for word in words:
-        word_counts[word] = word_counts.get(word, 0) + 1
-    repetition_score = sum(count for count in word_counts.values() if count > 3) / total_words if total_words > 0 else 0
-    
-    # Desânimo
-    discouragement_words = ["difícil", "complicado", "não sei explicar", "estou perdido", "não entendi"]
-    discouragement_count = sum(1 for token in doc if token.text.lower() in discouragement_words)
-    discouragement_ratio = discouragement_count / total_words if total_words > 0 else 0
-    
-    # Sentimento geral
-    sentiment_scores = sentiment_analyzer(transcription[:512])  # Limitar a 512 tokens
-    avg_sentiment = float(sentiment_scores[0]['score']) * 100 if sentiment_scores else 50.0
-    
-    return [avg_sent_length, insecurity_ratio, technical_density, negative_technical_ratio, didactic_ratio, interactivity_ratio, coherence_score, repetition_score, discouragement_ratio, avg_sentiment]
-
-# Função para extrair características de vídeo
-def extract_video_features(video_path):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError("Erro ao abrir o vídeo.")
-    
-    sampled_frames = 0
-    movement_frames = 0
-    prev_frame = None
-    frame_count = 0
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    sample_interval = max(1, int(fps))
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_count % sample_interval == 0:
-            sampled_frames += 1
+def analyze_body_language(video_path):
+    try:
+        print("Abrindo vídeo para análise de linguagem corporal...")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Não foi possível abrir o vídeo: {video_path}")
+        
+        prev_frame = None
+        movement_score = 0
+        frame_count = 0
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if prev_frame is not None:
                 diff = cv2.absdiff(gray, prev_frame)
-                movement = np.sum(diff) / (diff.shape[0] * diff.shape[1])
-                if movement > 15:
-                    movement_frames += 1
-            prev_frame = gray.copy()
-        frame_count += 1
-    
-    cap.release()
-    movement_ratio = movement_frames / sampled_frames if sampled_frames > 0 else 0
-    return [movement_ratio]
-
-# Função para treinar o modelo
-def train_model():
-    X = [
-        [94.85714285714286, 0.0007530120481927711, 0.01, 0.02, 0.001, 0.002, 0.4, 0.05, 0.01, 50.0, 0.039369076, 0.1, 0.10119047619047619],  # aula_1 (Ruim)
-        [12.452830188679245, 0.0015151515151515152, 0.02, 0.01, 0.002, 0.003, 0.5, 0.03, 0.005, 60.0, 0.04511572, 0.05, 0.07076923076923076],  # aula_2 (Médio)
-        [42.30232558139535, 0.0, 0.03, 0.005, 0.003, 0.004, 0.6, 0.02, 0.0, 70.0, 0.030089283, 0.02, 0.10897435897435898],                   # aula_3 (Bom)
-        [86.0, 0.0, 0.04, 0.0, 0.004, 0.005, 0.7, 0.01, 0.0, 75.0, 0.018021856, 0.01, 0.06426332288401254],                               # aula_4 (Bom)
-        [60.0, 0.0005, 0.015, 0.01, 0.002, 0.003, 0.55, 0.04, 0.008, 65.0, 0.035, 0.08, 0.09],  # aula_5 (Médio)
-        [30.0, 0.0, 0.025, 0.0, 0.003, 0.004, 0.65, 0.02, 0.0, 80.0, 0.025, 0.03, 0.12],         # aula_6 (Bom)
-        [100.0, 0.001, 0.005, 0.03, 0.001, 0.002, 0.45, 0.06, 0.015, 45.0, 0.042, 0.12, 0.07],  # aula_7 (Ruim)
-    ]
-    y = [0, 1, 2, 2, 1, 2, 0]  # 0: Ruim, 1: Médio, 2: Bom
-    
-    model = RandomForestClassifier(n_estimators=50, random_state=42)
-    model.fit(X, y)
-    print("Modelo treinado com sucesso! Conjunto de dados expandido.")
-    return model
-
-# Função para avaliar uma aula
-def evaluate_lesson(video_path, model, theme):
-    audio_path = extract_audio(video_path)
-    transcription = transcribe_audio(audio_path)
-    audio_features = extract_audio_features(audio_path)
-    text_features = extract_text_features(transcription, theme)
-    video_features = extract_video_features(video_path)
-    
-    features = text_features + audio_features + video_features
-    print(f"Características da nova aula: {features}")
-    
-    prediction = model.predict([features])
-    labels = {0: "Ruim", 1: "Médio", 2: "Bom"}
-    result = labels[prediction[0]]
-    
-    # Calcular o score
-    try:
-        probs = model.predict_proba([features])[0]
-        if len(probs) != 3:
-            print(f"Aviso: predict_proba retornou {len(probs)} classes ao invés de 3. Ajustando...")
-            probs = [probs[i] if i < len(probs) else 0.0 for i in range(3)]
-        score = probs[prediction[0]] * 100
-        score = max(0, min(100, score))
+                movement = np.mean(diff)
+                movement_score += movement
+                frame_count += 1
+            prev_frame = gray
+        
+        cap.release()
+        movement_score = movement_score / frame_count if frame_count > 0 else 0
+        movement_score = min(100, movement_score * 10)
+        print(f"Pontuação de linguagem corporal: {movement_score:.1f}")
+        return movement_score
     except Exception as e:
-        print(f"Erro ao calcular o score: {str(e)}. Calculando média dos critérios.")
-        criteria_scores = {}
-        avg_sent_length, insecurity_ratio, technical_density, negative_technical_ratio, didactic_ratio, interactivity_ratio, coherence_score, repetition_score, discouragement_ratio, avg_sentiment, energy_std, pause_ratio, movement_ratio = features
-        criteria_scores["Tom de Voz"] = max(0, min(100, 50 + (energy_std - 0.03) * 3000)) if energy_std >= 0.03 else 40
-        criteria_scores["Linguagem Corporal"] = max(0, min(100, 50 + (movement_ratio - 0.05) * 500)) if movement_ratio >= 0.05 else 40
-        criteria_scores["Clareza e Estrutura"] = max(0, min(100, 100 - (avg_sent_length - 30) * 1.5)) if avg_sent_length <= 70 else 0
-        criteria_scores["Ritmo"] = max(0, min(100, 100 - (pause_ratio - 0.1) * 250)) if pause_ratio <= 0.3 else 0
-        criteria_scores["Qualidade Técnica"] = max(0, min(100, (technical_density * 8000) - (negative_technical_ratio * 5000))) if technical_density >= 0.005 else 0
-        criteria_scores["Didática"] = max(0, min(100, didactic_ratio * 40000)) if didactic_ratio >= 0.001 else 0
-        criteria_scores["Interatividade"] = max(0, min(100, interactivity_ratio * 20000)) if interactivity_ratio >= 0.001 else 0
-        criteria_scores["Coerência"] = max(0, min(100, coherence_score * 150)) if coherence_score >= 0.5 else 0
-        criteria_scores["Estabilidade Emocional"] = max(0, min(100, avg_sentiment - (discouragement_ratio * 10000))) if discouragement_ratio <= 0.01 else 0
-        score = sum(criteria_scores.values()) / len(criteria_scores)
+        print(f"Erro na análise de linguagem corporal: {str(e)}")
+        return 50
 
-    # Justificativas e sugestões
-    avg_sent_length, insecurity_ratio, technical_density, negative_technical_ratio, didactic_ratio, interactivity_ratio, coherence_score, repetition_score, discouragement_ratio, avg_sentiment, energy_std, pause_ratio, movement_ratio = features
-    justification = []
-    suggestions = []
-    criteria_scores = {}
-    
-    # Avaliação por critério
-    criteria_scores["Tom de Voz"] = max(0, min(100, 50 + (energy_std - 0.03) * 3000)) if energy_std >= 0.03 else 40
-    criteria_scores["Linguagem Corporal"] = max(0, min(100, 50 + (movement_ratio - 0.05) * 500)) if movement_ratio >= 0.05 else 40
-    criteria_scores["Clareza e Estrutura"] = max(0, min(100, 100 - (avg_sent_length - 30) * 1.5)) if avg_sent_length <= 70 else 0
-    criteria_scores["Ritmo"] = max(0, min(100, 100 - (pause_ratio - 0.1) * 250)) if pause_ratio <= 0.3 else 0
-    criteria_scores["Qualidade Técnica"] = max(0, min(100, (technical_density * 8000) - (negative_technical_ratio * 5000))) if technical_density >= 0.005 else 0
-    criteria_scores["Didática"] = max(0, min(100, didactic_ratio * 40000)) if didactic_ratio >= 0.001 else 0
-    criteria_scores["Interatividade"] = max(0, min(100, interactivity_ratio * 20000)) if interactivity_ratio >= 0.001 else 0
-    criteria_scores["Coerência"] = max(0, min(100, coherence_score * 150)) if coherence_score >= 0.5 else 0
-    criteria_scores["Estabilidade Emocional"] = max(0, min(100, avg_sentiment - (discouragement_ratio * 10000))) if discouragement_ratio <= 0.01 else 0
+def parse_gemini_output(gemini_output):
+   
+    justifications = {}
+    suggestions = {}
+    final_score = 0.0
+    decision = "Reprovada"
 
-    if result == "Ruim":
-        if insecurity_ratio > 0.0005:
-            justification.append(f"Insegurança alta ({insecurity_ratio:.6f}) detectada.")
-            suggestions.append("Reduza erros ou hesitações no discurso.")
-        if avg_sent_length > 50:
-            justification.append(f"Sentenças longas ({avg_sent_length:.2f}) podem confundir.")
-            suggestions.append("Divida as sentenças em partes menores.")
-        if energy_std < 0.03:
-            justification.append(f"Tom de voz monótono ({energy_std:.6f}).")
-            suggestions.append("Aumente a variação no tom para engajar mais.")
-        if movement_ratio < 0.08:
-            justification.append(f"Movimento baixo ({movement_ratio:.3f}) na linguagem corporal.")
-            suggestions.append("Adicione gestos ou movimentação.")
-        if pause_ratio > 0.3:
-            justification.append(f"Ritmo irregular com muitas pausas ({pause_ratio:.2f}).")
-            suggestions.append("Reduza pausas longas para melhorar a fluidez.")
-        if technical_density < 0.005 or negative_technical_ratio > 0.01:
-            justification.append(f"Conhecimento técnico fraco (densidade: {technical_density:.3f}, erros: {negative_technical_ratio:.3f}).")
-            suggestions.append("Revise o conteúdo técnico e pratique a execução do código.")
-        if didactic_ratio < 0.001:
-            justification.append(f"Didática limitada ({didactic_ratio:.6f}).")
-            suggestions.append("Use mais exemplos ou explicações estruturadas.")
-        if interactivity_ratio < 0.001:
-            justification.append(f"Baixa interatividade ({interactivity_ratio:.6f}).")
-            suggestions.append("Inclua perguntas ou convites à participação.")
-        if coherence_score < 0.5:
-            justification.append(f"Coerência baixa ({coherence_score:.2f}).")
-            suggestions.append("Melhore a conexão entre ideias e sentenças.")
-        if repetition_score > 0.05:
-            justification.append(f"Alta repetição no discurso ({repetition_score:.3f}).")
-            suggestions.append("Evite repetir palavras ou ideias desnecessariamente.")
-        if discouragement_ratio > 0.005:
-            justification.append(f"Desânimo detectado ({discouragement_ratio:.6f}).")
-            suggestions.append("Tente manter um tom mais positivo e confiante.")
-    elif result == "Médio":
-        if insecurity_ratio > 0.001:
-            justification.append(f"Insegurança moderada ({insecurity_ratio:.6f}) detectada.")
-            suggestions.append("Minimize hesitações para maior confiança.")
-        if avg_sent_length > 30:
-            justification.append(f"Sentenças longas ({avg_sent_length:.2f}) podem ser melhoradas.")
-            suggestions.append("Simplifique a estrutura do roteiro.")
-        if energy_std < 0.04:
-            justification.append(f"Tom de voz com pouca variação ({energy_std:.6f}).")
-            suggestions.append("Varie mais o tom para dinamismo.")
-        if pause_ratio > 0.2:
-            justification.append(f"Ritmo pode melhorar ({pause_ratio:.2f}).")
-            suggestions.append("Ajuste o ritmo para evitar pausas longas.")
-        if technical_density < 0.01 or negative_technical_ratio > 0.005:
-            justification.append(f"Conhecimento técnico moderado (densidade: {technical_density:.3f}, erros: {negative_technical_ratio:.3f}).")
-            suggestions.append("Aprofunde o conteúdo técnico e evite erros no código.")
-        if didactic_ratio < 0.002:
-            justification.append(f"Didática pode melhorar ({didactic_ratio:.6f}).")
-            suggestions.append("Inclua mais exemplos práticos.")
-        if interactivity_ratio < 0.002:
-            justification.append(f"Interatividade moderada ({interactivity_ratio:.6f}).")
-            suggestions.append("Adicione mais perguntas ou interações.")
-        if coherence_score < 0.6:
-            justification.append(f"Coerência moderada ({coherence_score:.2f}).")
-            suggestions.append("Conecte melhor as ideias apresentadas.")
-        if repetition_score > 0.03:
-            justification.append(f"Repetição moderada no discurso ({repetition_score:.3f}).")
-            suggestions.append("Tente variar mais o vocabulário.")
-        if discouragement_ratio > 0.003:
-            justification.append(f"Leve desânimo detectado ({discouragement_ratio:.6f}).")
-            suggestions.append("Mantenha um tom mais confiante durante a aula.")
-    else:  # Bom
-        justification.append("Conteúdo bem estruturado e apresentado com confiança.")
-        suggestions.append("Mantenha o padrão de qualidade.")
+    lines = gemini_output.strip().split('\n')
 
-    justification = "; ".join(justification) if justification else "Nenhuma falha técnica significativa."
-    suggestion = "; ".join(suggestions) if suggestions else "Nenhuma sugestão de melhoria necessária."
+    crit_regex = re.compile(r"Critério:\s*(.*?),\s*Nota:\s*([\d.]+),\s*Justificativa:\s*(.*)")
+    sugg_regex = re.compile(r"Sugestão para\s*(.*?):\s*(.*)")
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        match_crit = crit_regex.match(line)
+        if match_crit:
+            criterion_full_name = match_crit.group(1).strip()
+            score_str = match_crit.group(2).strip()
+            justification_text = match_crit.group(3).strip()
+            
+            normalized_name = normalize_criterion_name(criterion_full_name)
+            justifications[normalized_name] = {
+                "full_name": criterion_full_name,
+                "score": float(score_str),
+                "text": justification_text
+            }
+            continue
+
+        match_sugg = sugg_regex.match(line)
+        if match_sugg:
+            criterion_sugg_full_name = match_sugg.group(1).strip()
+            suggestion_text = match_sugg.group(2).strip()
+            
+            normalized_name = normalize_criterion_name(criterion_sugg_full_name)
+            suggestions[normalized_name] = suggestion_text
+            continue
+
+        if line.startswith("Nota Final:"):
+            try:
+                score_part = line.split(":")[1].strip().split(',')[0]
+                final_score = float(score_part)
+            except ValueError:
+                print(f"Erro ao parsear Nota Final: '{line}'")
+                final_score = 0.0
+            continue
+
+        if line.startswith("Decisão:"):
+            decision = line.split(":")[1].strip()
+            continue
 
     return {
-        "Qualidade Geral": f"{result} (score: {score:.1f}/100)",
-        "Justificativa Técnica": justification,
-        "Sugestão Geral": suggestion,
-        "Criteria Scores": criteria_scores
+        "final_score": final_score,
+        "decision": decision,
+        "justifications": justifications,
+        "suggestions": suggestions
     }
 
-# Função para gerar relatório em PDF estilizado
-def generate_pdf_report(results, lesson_type, theme, output_path="relatorio_aula_nova.pdf"):
-    doc = SimpleDocTemplate(output_path, pagesize=letter)
-    elements = []
-    
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        name='TitleStyle',
-        parent=styles['Title'],
-        fontSize=18,
-        spaceAfter=12,
-        textColor=colors.navy
-    )
-    heading_style = ParagraphStyle(
-        name='HeadingStyle',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=6,
-        textColor=colors.black
-    )
-    normal_style = ParagraphStyle(
-        name='NormalStyle',
-        parent=styles['Normal'],
-        fontSize=12,
-        spaceAfter=6,
-        leading=14
-    )
-    quality_style = ParagraphStyle(
-        name='QualityStyle',
-        parent=styles['Normal'],
-        fontSize=12,
-        spaceAfter=6,
-        leading=14,
-        textColor=colors.green if "Bom" in results["Qualidade Geral"] else colors.orange if "Médio" in results["Qualidade Geral"] else colors.red
-    )
-    summary_style = ParagraphStyle(
-        name='SummaryStyle',
-        parent=styles['Normal'],
-        fontSize=12,
-        spaceAfter=12,
-        leading=14,
-        textColor=colors.darkblue
-    )
-    
-    elements.append(Paragraph("Relatório de Auditoria de Aula", title_style))
-    elements.append(Paragraph(f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", normal_style))
-    elements.append(Spacer(1, 12))
-    
-    elements.append(Paragraph("Informações Gerais", heading_style))
-    elements.append(Paragraph(f"Tipo de Aula: {lesson_type.capitalize()}", normal_style))
-    elements.append(Paragraph(f"Tema da Aula: {theme.capitalize()}", normal_style))
-    elements.append(Spacer(1, 12))
-    
-    elements.append(Paragraph("Resultados da Análise", heading_style))
-    elements.append(Paragraph(f"Análise Geral: {results['Qualidade Geral']}", quality_style))
-    elements.append(Paragraph(f"Justificativa Técnica: {results['Justificativa Técnica']}", normal_style))
-    elements.append(Paragraph(f"Sugestões de Melhoria: {results['Sugestão Geral']}", normal_style))
-    
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph("Avaliação por Critério", heading_style))
-    for criterion, score in results["Criteria Scores"].items():
-        color = colors.green if score >= 70 else colors.orange if score >= 50 else colors.red
-        score_style = ParagraphStyle(
-            name=f'{criterion}Style',
-            parent=normal_style,
-            textColor=color
-        )
-        elements.append(Paragraph(f"{criterion}: {score:.1f}/100", score_style))
-    
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph("Resumo da Aula", heading_style))
-    summary = ""
-    if "Ruim" in results["Qualidade Geral"]:
-        summary += "A aula foi reprovada devido a problemas na entrega e conteúdo. "
-    elif "Médio" in results["Qualidade Geral"]:
-        summary += "A aula teve desempenho médio, com pontos a melhorar. "
-    else:
-        summary += "A aula foi aprovada, com boa estrutura e apresentação. "
-    if results["Criteria Scores"]["Tom de Voz"] < 50:
-        summary += "Tom de voz monótono é um ponto negativo. "
-    if results["Criteria Scores"]["Linguagem Corporal"] < 50:
-        summary += "Falta de movimento na linguagem corporal prejudicou a entrega. "
-    if results["Criteria Scores"]["Qualidade Técnica"] >= 70:
-        summary += "Conhecimento técnico sólido é um ponto positivo. "
-    elif results["Criteria Scores"]["Qualidade Técnica"] < 50:
-        summary += "Falta de domínio técnico foi um ponto fraco. "
-    if results["Criteria Scores"]["Didática"] >= 70:
-        summary += "Explicações claras destacaram a didática. "
-    elif results["Criteria Scores"]["Didática"] < 50:
-        summary += "Didática limitada dificultou o entendimento. "
-    if results["Criteria Scores"]["Interatividade"] >= 70:
-        summary += "Boa interatividade engajou os alunos. "
-    elif results["Criteria Scores"]["Interatividade"] < 50:
-        summary += "Interatividade baixa foi um ponto fraco. "
-    if results["Criteria Scores"]["Estabilidade Emocional"] < 50:
-        summary += "Desânimo ou insegurança foram evidentes. "
-    elements.append(Paragraph(summary, summary_style))
-    
-    doc.build(elements)
-    return output_path
+def normalize_criterion_name(name):
+    name = re.sub(r'\(.*?\)', '', name)
+    name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('utf-8')
+    name = re.sub(r'[^a-zA-Z\s]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name.lower()
 
-# Função para inferir tipo e tema
-def infer_lesson_type_and_theme(transcription):
-    doc = nlp(transcription.lower())
-    project_keywords = ["projeto", "passo a passo", "implementar"]
-    practical_keywords = ["exemplo", "prática", "exercício"]
-    error_keywords = ["erro", "exceção", "try", "except"]
-    
-    project_score = sum(1 for token in doc if token.text in project_keywords)
-    practical_score = sum(1 for token in doc if token.text in practical_keywords)
-    error_score = sum(1 for token in doc if token.text in error_keywords)
-    
-    if project_score > 3:
-        lesson_type = "orientada a projetos"
-    elif practical_score > 3:
-        lesson_type = "prática"
-    else:
-        lesson_type = "teórica"
-    
-    if error_score > 3:
-        theme = "tratamento de erros"
-    else:
-        theme = "geral"
-    
-    return lesson_type, theme
+def evaluate_lesson(transcription, movement_score):
+    if not transcription:
+        print("Transcrição vazia. Retornando valores padrão.")
+        return {
+            "final_score": 50,
+            "decision": "Reprovada",
+            "justifications": {
+                "qualidade_tecnica": {"full_name": "Qualidade Técnica do Conteúdo Transmitido", "score": 50, "text": "Transcrição vazia ou inválida."},
+                "linguagem_corporal": {"full_name": "Linguagem Corporal do Professor", "score": 50, "text": "Transcrição vazia ou inválida."},
+                "tom_de_voz": {"full_name": "Tom de Voz", "score": 50, "text": "Transcrição vazia ou inválida."},
+                "clareza_roteiro": {"full_name": "Clareza e Estrutura do Roteiro", "score": 50, "text": "Transcrição vazia ou inválida."},
+                "ritmo": {"full_name": "Ritmo da Apresentação", "score": 50, "text": "Transcrição vazia ou inválida."},
+                "didatica": {"full_name": "Didática", "score": 50, "text": "Transcrição vazia ou inválida."},
+                "qualidade_geral": {"full_name": "Qualidade Geral da Aula", "score": 50, "text": "Transcrição vazia ou inválida."}
+            },
+            "suggestions": {
+                "qualidade_tecnica": "Verifique o vídeo e a configuração do Whisper.",
+                "linguagem_corporal": "Verifique o vídeo e a configuração do Whisper.",
+                "tom_de_voz": "Verifique o vídeo e a configuração do Whisper.",
+                "clareza_roteiro": "Verifique o vídeo e a configuração do Whisper.",
+                "ritmo": "Verifique o vídeo e a configuração do Whisper.",
+                "didatica": "Verifique o vídeo e a configuração do Whisper.",
+                "qualidade_geral": "Verifique o vídeo e a configuração do Whisper."
+            },
+            "scores": {
+                "qualidade_tecnica": 50,
+                "linguagem_corporal": 50,
+                "tom_de_voz": 50,
+                "clareza_roteiro": 50,
+                "ritmo": 50,
+                "didatica": 50,
+                "qualidade_geral": 50
+            }
+        }
 
-# Função principal
-def main():
     try:
-        clean_temp_files()
-        
-        model = train_model()
-        if not model:
-            print("Não foi possível treinar o modelo com os dados fornecidos.")
-            return
-        
-        print("Modelo treinado com sucesso! Agora você pode avaliar novas aulas.")
-        
-        while True:
-            choice = input("Deseja avaliar uma nova aula? (s/n): ").lower()
-            if choice == 's':
-                video_path = input("Digite o caminho da nova aula (ex.: C:\\Users\\Bolado\\Desktop\\aula_nova.mp4): ")
-                video_path = video_path.replace("\\", "\\\\")
-                audio_path = extract_audio(video_path)
-                print("Áudio extraído com sucesso.")
-
-                transcription = transcribe_audio(audio_path)
-                print("Transcrição concluída:", transcription[:100], "...")
-
-                lesson_type, theme = infer_lesson_type_and_theme(transcription)
-                print(f"Tipo de aula inferido: {lesson_type}")
-                print(f"Tema da aula inferido: {theme}")
-
-                overall_analysis = evaluate_lesson(video_path, model, theme)  # Passar theme aqui
-                print("Avaliação geral concluída:", overall_analysis)
-
-                results = {
-                    "Qualidade Geral": overall_analysis["Qualidade Geral"],
-                    "Justificativa Técnica": overall_analysis["Justificativa Técnica"],
-                    "Sugestão Geral": overall_analysis["Sugestão Geral"],
-                    "Criteria Scores": overall_analysis["Criteria Scores"]
-                }
-                report_path = generate_pdf_report(results, lesson_type, theme)
-                print(f"Relatório gerado: {report_path}")
-            elif choice == 'n':
-                print("Encerrando o programa.")
-                break
-            else:
-                print("Opção inválida. Digite 's' para sim ou 'n' para não.")
-
+        print("Tokenizando transcrição...")
+        sentences = nltk.sent_tokenize(transcription, language="portuguese")
+        if not sentences:
+            sentences = [transcription]
     except Exception as e:
-        print(f"Erro: {str(e)}")
-    finally:
-        clean_temp_files()
+        print(f"Erro na tokenização: {str(e)}")
+        sentences = [transcription]
 
-if __name__ == "__main__":
-    main()
+    prompt = f"""
+    Você é um auditor de aulas altamente inteligente, experiente e rigoroso. Sua função é analisar detalhadamente a transcrição de aulas, identificar todos os pontos fracos e fortes, e fornecer feedback construtivo e preciso. Sua análise deve buscar a excelência e a qualidade, sendo imparcial e contextualizada.
+
+**Instruções Essenciais para Avaliação:**
+- A **Qualidade Técnica do Conteúdo Transmitido** é o critério de **MAIOR PESO**. Sua avaliação deve ser **EXCLUSIVAMENTE** baseada em:
+    - **Domínio do Assunto:** O professor demonstra profundo conhecimento?
+    - **Precisão Conceitual:** As explicações são corretas e sem ambiguidades?
+    - **Ausência de Erros:** Há erros de código, informações incorretas ou retrabalho excessivo?
+    - **Fluidez na Execução:** A demonstração prática é suave e sem hesitações técnicas ou repetições desnecessárias de ações (como copiar/colar várias vezes a mesma coisa)?
+    - **Clareza na Explicação Técnica:** O conteúdo técnico é apresentado de forma compreensível e direta?
+- **Problemas técnicos graves (erros de código, imprecisões conceituais, insegurança visível no domínio técnico) devem resultar em PONTUAÇÕES MUITO BAIXAS para a Qualidade Técnica e impactar severamente a Nota Final.** A detecção de falhas críticas nesse aspecto pode levar à reprovação imediata.
+- **Sobre a Informalidade (aplicável a Tom de Voz e Didática):**
+    - A linguagem informal (ex: "bora pro vídeo", "a gente") **não é inerentemente negativa**.
+    - Avalie se a informalidade contribui para o engajamento do aluno e a conexão com o professor.
+    - Penalize a informalidade apenas quando ela se torna **excessiva, repetitiva (vícios de linguagem como "né", "ok", "aí" em demasia), confusa, ou prejudica a clareza e a credibilidade técnica** do conteúdo.
+- Seja exigente nas notas, mas justo. Evite notas "padrão". Cada aula deve ser avaliada por seus méritos e deméritos específicos.
+- As justificativas e sugestões devem ser extremamente específicas, acionáveis e diretas, sem floreios.
+
+# Exemplos de Relatórios de Auditoria de Aula (para referência de estilo e profundidade esperados)
+
+## Exemplo de Aula de Qualidade RUIM (DEVE SER REPROVADA):
+### Análise Humana Resumida: O professor não demonstra habilidades com o componente, demonstrando insegurança e pouca dinâmica nas aulas. Além de errar bastante com os códigos e ficar refazendo a mesma coisa diversas vezes.
+Critério: Qualidade Técnica do Conteúdo Transmitido, Nota: 15, Justificativa: O professor demonstrou clara falta de domínio do assunto, com erros frequentes de código e necessidade constante de refazer operações básicas. A insegurança técnica foi perceptível ao longo de toda a aula.
+Critério: Linguagem Corporal do Professor, Nota: 30, Justificativa: A descrição de movimento indica pouca variação, sugerindo rigidez ou falta de expressividade que impacta o engajamento. A postura estática não complementa a comunicação verbal.
+Critério: Tom de Voz, Nota: 40, Justificativa: O tom de voz foi monótono, sem variações que pudessem manter a atenção do aluno. O uso **excessivo e repetitivo de interjeições (ex: "né", "ok")** e a falta de dinamismo prejudicaram a fluidez e a percepção profissional.
+Critério: Clareza e Estrutura do Roteiro, Nota: 20, Justificativa: O roteiro da aula foi completamente desorganizado e sem uma linha lógica. O professor saltou entre tópicos sem transições claras, gerando confusão.
+Critério: Ritmo da Apresentação, Nota: 25, Justificativa: O ritmo foi inconsistentemente lento, com pausas excessivas e divagações. A aula não progrediu de forma eficiente, desperdiçando o tempo do espectador.
+Critério: Didática, Nota: 10, Justificativa: A didática foi inexistente, com explicações confusas e ausência total de exemplos práticos. O professor não demonstrou capacidade de transmitir o conhecimento de forma eficaz.
+Critério: Qualidade Geral da Aula, Nota: 15, Justificativa: A aula foi de baixíssima qualidade, com falhas críticas em todos os aspectos, especialmente na técnica. É inviável para fins educacionais.
+Sugestão para Qualidade Técnica do Conteúdo Transmitido: Revisar exaustivamente o conteúdo técnico e praticar a execução dos exemplos para garantir fluidez e correção.
+Sugestão para Linguagem Corporal do Professor: Incorporar gestos e expressões faciais mais dinâmicas para acompanhar a fala e engajar o público.
+Sugestão para Tom de Voz: Praticar a modulação da voz para criar variações e manter o interesse do aluno. Minimizar o uso excessivo de interjeições que não agregam valor.
+Sugestão para Clareza e Estrutura do Roteiro: Desenvolver um roteiro detalhado e seguir uma estrutura lógica clara, com introdução, desenvolvimento e conclusão bem definidos.
+Sugestão para Ritmo da Apresentação: Cronometrar as seções da aula para garantir um ritmo adequado e evitar pausas prolongadas ou pressa.
+Sugestão para Didática: Utilizar exemplos práticos e analogias claras, além de interagir mais com o conteúdo para facilitar a compreensão do aluno.
+Sugestão para Qualidade Geral da Aula: Realizar um planejamento completo e uma simulação da aula antes da gravação final.
+Nota Final: 22, Decisão: Reprovada.
+
+## Exemplo de Aula de Qualidade MÉDIA (Pode ser Aprovada/Reprovada dependendo da nota final, mas com sugestões para aprimoramento):
+### Análise Humana Resumida: O professor tem conhecimento sobre o assunto, mas a aula não é tão atrativa quanto outros componentes. Apresenta alguns momentos de hesitação e a didática poderia ser mais envolvente.
+Critério: Qualidade Técnica do Conteúdo Transmitido, Nota: 70, Justificativa: O conteúdo técnico apresentado é preciso e relevante para o tema da aula. No entanto, houve algumas pequenas hesitações na execução do código que poderiam ser mais fluidas. O domínio do assunto é evidente.
+Critério: Linguagem Corporal do Professor, Nota: 65, Justificativa: O nível de movimento demonstra uma presença razoável, mas pode ser mais expressivo. A postura pode ser aprimorada para transmitir maior confiança e dinamismo.
+Critério: Tom de Voz, Nota: 60, Justificativa: O tom de voz é claro e com variação razoável. O uso de **linguagem informal (ex: "bora pro vídeo")** contribui para o engajamento, mas a presença ocasional de vícios de linguagem pode ser minimizada para otimizar a clareza.
+Critério: Clareza e Estrutura do Roteiro, Nota: 68, Justificativa: O roteiro da aula é compreensível, mas em alguns momentos a transição entre tópicos não é fluida. A organização geral permite o acompanhamento, mas há espaço para maior concisão.
+Critério: Ritmo da Apresentação, Nota: 62, Justificativa: O ritmo é aceitável, mas há pequenas pausas que quebram o fluxo da apresentação. A aula flui, mas pode ser otimizada para ser mais dinâmica.
+Critério: Didática, Nota: 58, Justificativa: A didática é funcional, mas a aula carece de exemplos práticos mais envolventes ou analogias que facilitem a compreensão. A informalidade presente é neutra para o engajamento, mas a profundidade da explicação pode ser maior.
+Critério: Qualidade Geral da Aula, Nota: 64, Justificativa: A aula é informativa e o professor domina o assunto, mas a apresentação geral não cativa completamente. Com alguns ajustes, a aula tem potencial para ser muito mais impactante.
+Sugestão para Qualidade Técnica do Conteúdo Transmitido: Praticar a execução de trechos de código para garantir fluidez e eliminar hesitações.
+Sugestão para Linguagem Corporal do Professor: Adicionar gestos mais expressivos e intencionais para complementar a fala e aumentar o engajamento visual.
+Sugestão para Tom de Voz: Buscar um equilíbrio entre o engajamento proporcionado pela informalidade e a minimização de repetições e vícios de linguagem para maior profissionalismo.
+Sugestão para Clareza e Estrutura do Roteiro: Otimizar as transições entre os tópicos, utilizando frases de ligação mais claras e resumos parciais.
+Sugestão para Ritmo da Apresentação: Identificar e reduzir pausas desnecessárias, e praticar a fluidez das falas para manter um ritmo mais consistente.
+Sugestão para Didática: Incluir exemplos mais elaborados ou casos de uso reais que reforcem o aprendizado e tornem a aula mais interativa.
+Nota Final: 64.7, Decisão: Aprovada.
+
+## Exemplo de Aula de Qualidade BOA (DEVE SER APROVADA):
+### Análise Humana Resumida: Professores tiveram total domínio do assunto e fizeram a aula orientada por projeto, o que facilita o ensino para o estudante, além de conseguir criar uma ordem de continuidade com início, meio e fim.
+Critério: Qualidade Técnica do Conteúdo Transmitido, Nota: 95, Justificativa: O professor demonstrou domínio completo do assunto, com explicações precisas e execução impecável do código. Não foram identificados erros, imprecisões técnicas ou hesitações.
+Critério: Linguagem Corporal do Professor, Nota: 90, Justificativa: O nível de movimento indica uma linguagem corporal dinâmica e engajadora, que complementa a fala. A postura confiante e os gestos foram adequados ao contexto.
+Critério: Tom de Voz, Nota: 92, Justificativa: O tom de voz é claro, modulado e com excelente projeção, mantendo o interesse do aluno. A entonação é variada e contribui para a clareza da explicação, utilizando a informalidade de forma estratégica e controlada para conectar-se com o público.
+Critério: Clareza e Estrutura do Roteiro, Nota: 98, Justificativa: O roteiro da aula é exemplarmente claro e bem estruturado, com uma progressão lógica de início, meio e fim. A transição entre tópicos é suave e eficiente.
+Critério: Ritmo da Apresentação, Nota: 95, Justificativa: O ritmo da apresentação é excelente, permitindo que o aluno absorva o conteúdo sem sentir pressa ou tédio. As pausas são estratégicas e bem utilizadas.
+Critério: Didática, Nota: 96, Justificativa: A didática é altamente eficaz, com uso inteligente de exemplos práticos e uma metodologia orientada a projetos que facilita o aprendizado. O professor é engajador e inspira confiança, inclusive através do uso de uma linguagem acessível e pontualmente informal que beneficia o aprendizado.
+Critério: Qualidade Geral da Aula, Nota: 95, Justificativa: A aula é de altíssima qualidade, superando as expectativas em todos os critérios. Representa um excelente recurso educacional.
+Nota Final: 95.9, Decisão: Aprovada.
+
+---
+
+Agora, baseado na transcrição e nos dados fornecidos, avalie a aula atual:
+
+- Transcrição: {transcription} (completa)
+- Nível de movimento (linguagem corporal): {movement_score}
+
+Avalie os seguintes critérios (atribua uma nota de 0 a 100 para cada e explique brevemente, com variações baseadas no conteúdo):
+1. Qualidade técnica do conteúdo (clareza, precisão, relevância, ausência de erros, fluidez na execução, domínio do componente)
+2. Linguagem corporal (baseado no movimento fornecido e inferências sobre postura/expressão)
+3. Tom de voz (inferido da estrutura e escolha de palavras, entonação, dinamismo, equilíbrio entre formalidade e engajamento, presença de vícios de linguagem)
+4. Clareza e estrutura do roteiro (organização, lógica, transições, concisão, eliminação de redundâncias)
+5. Ritmo da apresentação (pausas, fluidez, dinamismo, eficiência no tempo)
+6. Didática (engajamento, uso de exemplos, analogias, explicações aprofundadas, metodologia de ensino, impacto da informalidade no aprendizado)
+7. Qualidade geral (impressão geral da aula, potencial de aprendizado, refinamento)
+
+Forneça:
+- Uma nota final (média dos critérios)
+- Decisão: Aprovar (nota >= {APPROVAL_THRESHOLD}) ou Reprovada
+- Justificativas detalhadas para cada critério (mínimo de 2 frases por critério, foco em pontos fracos e áreas de melhoria)
+- Sugestões de melhoria (se reprovada ou se a nota do critério for inferior a 70, específicas e acionáveis, exatamente 1 sugestão por critério. Se a aula for aprovada e todas as notas forem >= 70, não é preciso fornecer sugestões)
+
+Responda em português e em formato estruturado, **sem adicionar cabeçalhos ou títulos extras**. Mantenha **exatamente** o formato solicitado para cada linha:
+Critério: [nome do critério], Nota: [valor numérico], Justificativa: [texto da justificativa].
+Sugestão para [nome do critério]: [texto da sugestão].
+Nota Final: [valor numérico], Decisão: [Aprovada/Reprovada]
+    """
+
+    headers = {"Content-Type": "application/json"}
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    try:
+        print("Enviando requisição para Gemini 1.5 Flash...")
+        response = requests.post(f"{API_URL}?key={API_KEY}", headers=headers, json=data)
+        response.raise_for_status()
+        output = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        print(f"Resposta bruta da API (completa): {output}")
+
+        evaluation = parse_gemini_output(output)
+
+        # Mapeamento de critérios normalizados para chaves internas
+        criterion_mapping = {
+            "qualidade tecnica do conteudo": "qualidade_tecnica",
+            "linguagem corporal": "linguagem_corporal",
+            "tom de voz": "tom_de_voz",
+            "clareza e estrutura do roteiro": "clareza_roteiro",
+            "ritmo da apresentacao": "ritmo",
+            "didatica": "didatica",
+            "qualidade geral": "qualidade_geral"
+        }
+
+        # Reorganizar justifications e suggestions para as chaves internas
+        justifications = {}
+        suggestions = {}
+        for norm_name, data in evaluation["justifications"].items():
+            internal_key = criterion_mapping.get(norm_name)
+            if internal_key:
+                justifications[internal_key] = data
+
+        for norm_name, text in evaluation["suggestions"].items():
+            internal_key = criterion_mapping.get(norm_name)
+            if internal_key:
+                suggestions[internal_key] = text
+
+        # Calcular scores a partir das justificativas
+        scores = {k: v["score"] for k, v in justifications.items()}
+
+        # Preencher valores padrão para critérios não retornados pela API
+        all_criteria = {"qualidade_tecnica", "linguagem_corporal", "tom_de_voz", "clareza_roteiro", "ritmo", "didatica", "qualidade_geral"}
+        for crit in all_criteria:
+            if crit not in scores:
+                scores[crit] = 50
+                justifications[crit] = {"full_name": next((k for k, v in criterion_mapping.items() if v == crit), crit).replace("_", " ").title(), "score": 50, "text": "Avaliação não fornecida pela API."}
+            if crit not in suggestions:
+                suggestions[crit] = "Nenhuma sugestão específica fornecida."
+
+        final_score = evaluation["final_score"]
+        decision = "Aprovada" if final_score >= APPROVAL_THRESHOLD else "Reprovada"
+
+        print(f"Nota final (API): {final_score:.1f}, Decisão (recalculada): {decision}")
+        print(f"Scores: {scores}")
+        print(f"Justifications: {justifications}")
+        print(f"Suggestions: {suggestions}")
+
+        return {
+            "final_score": final_score,
+            "decision": decision,
+            "justifications": justifications,
+            "suggestions": suggestions,
+            "scores": scores
+        }
+
+    except requests.RequestException as e:
+        print(f"Erro na chamada da API: {str(e)}")
+        return {
+            "final_score": 50,
+            "decision": "Reprovada",
+            "justifications": {
+                "qualidade_tecnica": {"full_name": "Qualidade Técnica do Conteúdo Transmitido", "score": 50, "text": f"Erro na API: {str(e)}"},
+                "linguagem_corporal": {"full_name": "Linguagem Corporal do Professor", "score": 50, "text": "Erro na API."},
+                "tom_de_voz": {"full_name": "Tom de Voz", "score": 50, "text": "Erro na API."},
+                "clareza_roteiro": {"full_name": "Clareza e Estrutura do Roteiro", "score": 50, "text": "Erro na API."},
+                "ritmo": {"full_name": "Ritmo da Apresentação", "score": 50, "text": "Erro na API."},
+                "didatica": {"full_name": "Didática", "score": 50, "text": "Erro na API."},
+                "qualidade_geral": {"full_name": "Qualidade Geral da Aula", "score": 50, "text": "Erro na API."}
+            },
+            "suggestions": {},
+            "scores": {
+                "qualidade_tecnica": 50,
+                "linguagem_corporal": 50,
+                "tom_de_voz": 50,
+                "clareza_roteiro": 50,
+                "ritmo": 50,
+                "didatica": 50,
+                "qualidade_geral": 50
+            }
+        }
+
+def escape_latex(text):
+    if text is None:
+        return ""
+    
+    text = str(text)
+    text = text.replace('\n', ' ')
+    text = text.replace('&', '\\&')
+    text = text.replace('%', '\\%')
+    text = text.replace('$', '\\$')
+    text = text.replace('#', '\\#')
+    text = text.replace('_', '\\_')
+    text = text.replace('{', '\\{')
+    text = text.replace('}', '\\}')
+    text = text.replace('~', '\\textasciitilde{}')
+    text = text.replace('^', '\\textasciicircum{}')
+    text = text.replace('\\', '\\textbackslash{}')
+    text = text.replace('<', '\\textless{}')
+    text = text.replace('>', '\\textgreater{}')
+    text = text.replace('\'', '\'')
+    text = text.replace('"', '``')
+    text = text.replace('...', '.\protect\ldots')
+    text = text.replace('|', '\\textbar{}')
+    return text
+
+def generate_pdf_report(evaluation):
+    try:
+        print("Criando documento LaTeX...")
+        doc = Document('audit_report', documentclass='memoir')
+
+        doc.preamble.append(Command('usepackage', 'fontenc', 'T1'))
+        doc.preamble.append(Command('usepackage', 'lmodern'))
+        doc.preamble.append(Command('usepackage', 'textcomp'))
+        doc.preamble.append(Command('usepackage', 'inputenc', 'utf8'))
+        doc.preamble.append(Command('usepackage', 'babel', 'brazilian'))
+        doc.preamble.append(Command('usepackage', 'geometry'))
+        doc.preamble.append(NoEscape(r'\geometry{a4paper, margin=0.8in}'))
+        doc.preamble.append(Command('usepackage', 'titlesec'))
+        doc.preamble.append(Command('usepackage', 'fancyhdr'))
+        doc.preamble.append(Command('usepackage', 'xcolor'))
+        doc.preamble.append(Command('usepackage', 'noto'))
+        doc.preamble.append(Command('usepackage', 'hyperref'))
+        doc.preamble.append(NoEscape(r'\hypersetup{colorlinks=true, urlcolor=blue, linkcolor=blue}'))
+
+        doc.preamble.append(NoEscape(r'\titleformat{\section}{\normalfont\Large\bfseries\color{blue!80!black}}{\thesection}{1em}{}'))
+        doc.preamble.append(NoEscape(r'\titleformat{\subsection}{\normalfont\large\bfseries\color{blue!60!black}}{\thesubsection}{1em}{}'))
+
+        doc.preamble.append(NoEscape(r'\pagestyle{fancy}'))
+        doc.preamble.append(NoEscape(r'\fancyhf{}'))
+        doc.preamble.append(NoEscape(r'\fancyhead[L]{\color{gray}\small Relatório de Auditoria de Aula}'))
+        doc.preamble.append(NoEscape(r'\fancyhead[R]{\color{gray}\small \today}'))
+        doc.preamble.append(NoEscape(r'\fancyfoot[C]{\color{gray}\thepage}'))
+        doc.preamble.append(NoEscape(r'\renewcommand{\headrulewidth}{0.4pt}'))
+        doc.preamble.append(NoEscape(r'\renewcommand{\footrulewidth}{0.4pt}'))
+
+        doc.preamble.append(NoEscape(r'\setmainfont{Noto Serif}'))
+
+        doc.preamble.append(Command('title', NoEscape(r'Relatório de Auditoria de Aula \\ \large Análise Automatizada')))
+        doc.preamble.append(Command('author', ''))
+        doc.preamble.append(Command('date', r'\today'))
+
+        doc.append(NoEscape(r'\maketitle'))
+        doc.append(NoEscape(r'\vspace{1cm}'))
+
+        with doc.create(Section('Resultados da Análise Automática')):
+            doc.append('Este relatório apresenta os resultados detalhados da análise automática da aula.')
+            doc.append(NoEscape(r'\vspace{0.5cm}'))
+
+            with doc.create(Subsection('Nota Final')):
+                doc.append(NoEscape(f'\\textbf{{{evaluation["final_score"]:.1f}}}'))
+                doc.append(NoEscape(r'\newline'))
+
+            with doc.create(Subsection('Decisão')):
+                decision_color = 'green!60!black' if evaluation['decision'] == 'Aprovada' else 'red!60!black'
+                doc.append(NoEscape(f'\\color{{{decision_color}}}{escape_latex(evaluation["decision"])}'))
+                doc.append(NoEscape(r'\newline'))
+
+            with doc.create(Subsection('Justificativas')):
+                display_to_key_map = {
+                    "Qualidade Técnica do Conteúdo Transmitido": "qualidade_tecnica",
+                    "Linguagem Corporal do Professor": "linguagem_corporal",
+                    "Tom de Voz": "tom_de_voz",
+                    "Clareza e Estrutura do Roteiro": "clareza_roteiro",
+                    "Ritmo da Apresentação": "ritmo",
+                    "Didática": "didatica",
+                    "Qualidade Geral da Aula": "qualidade_geral"
+                }
+
+                for display_name, internal_key in display_to_key_map.items():
+                    score_val = evaluation['scores'].get(internal_key, 50)
+                    justification_text = evaluation['justifications'].get(internal_key, {"text": "Avaliação não fornecida pela API."}).get("text", "Avaliação não fornecida pela API.")
+                    doc.append(NoEscape(
+                        f'\\noindent\\color{{blue!80!black}}\\textbf{{{escape_latex(display_name)}}} '
+                        f'(Nota: \\color{{black}}{score_val}): '
+                        f'{escape_latex(justification_text)}\\par\\vspace{{0.3cm}}'
+                    ))
+
+            if evaluation['decision'] == 'Reprovada':
+                with doc.create(Subsection('Sugestões de Melhoria')):
+                    doc.append(NoEscape(r'\vspace{0.3cm}'))
+                    for display_name, internal_key in display_to_key_map.items():
+                        if evaluation['scores'].get(internal_key, 0) < APPROVAL_THRESHOLD:
+                            suggestion_text = evaluation['suggestions'].get(internal_key, "Nenhuma sugestão específica fornecida.")
+                            doc.append(NoEscape(
+                                f'\\noindent\\color{{blue!80!black}}\\textbf{{{escape_latex(display_name)}}}: '
+                                f'\\color{{black}}{escape_latex(suggestion_text)}\\par\\vspace{{0.2cm}}'
+                            ))
+
+        print("Salvando arquivo LaTeX...")
+        doc.generate_tex()
+
+        print("Compilando PDF...")
+        tex_file_name = 'audit_report.tex'
+        pdf_file_name = 'audit_report.pdf'
+
+        for ext in ['.aux', '.log', '.out', '.toc', '.lof', '.lot', '.fls', '.fdb_latexmk']:
+            temp_file = os.path.join(os.getcwd(), pdf_file_name.replace('.pdf', ext))
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        start_time = time.time()
+        process = subprocess.run(
+            ['latexmk', '-pdf', '-xelatex', '-interaction=nonstopmode', tex_file_name],
+            cwd=os.getcwd(),
+            timeout=300,
+            capture_output=True,
+            text=True
+        )
+        end_time = time.time()
+        print(f"Tempo de compilação do PDF: {end_time - start_time:.2f} segundos")
+
+        print("\n--- Saída do Latexmk (stdout) ---")
+        print(process.stdout)
+        print("--- Fim da Saída do Latexmk (stdout) ---\n")
+
+        print("\n--- Saída do Latexmk (stderr) ---")
+        print(process.stderr)
+        print("--- Fim da Saída do Latexmk (stderr) ---\n")
+
+        if process.returncode != 0:
+            print(f"Erro na compilação do PDF: Código de saída {process.returncode}")
+            with open("latex_error.log", "w", encoding="utf-8") as f:
+                f.write(f"STDOUT:\n{process.stdout}\n\nSTDERR:\n{process.stderr}")
+            raise Exception(f"Falha na compilação do PDF. Verifique 'latex_error.log' para detalhes. Erro: {process.stderr}")
+
+        return pdf_file_name
+
+    except subprocess.TimeoutExpired:
+        print("Erro: Compilação do PDF excedeu o tempo limite.")
+        return None
+    except Exception as e:
+        print(f"Erro na geração do PDF: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def send_to_monday(evaluation, pdf_path=None): # Adicionado pdf_path com valor padrão None
+    headers = {
+        "Authorization": f"{MONDAY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    item_name = f"Aula - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"
+    suggestions_text = "; ".join([f"{k.replace('_', ' ').title()}: {v}" for k, v in evaluation["suggestions"].items() if v != "Nenhuma sugestão específica fornecida."])
+    
+    column_values = {
+        "name": item_name,
+        "project_status": {"label": evaluation["decision"]},
+        "numeric_mkrmq7jr": evaluation["final_score"],
+        "numeric_mkrm5m2f": evaluation["scores"].get("qualidade_tecnica", 50),
+        "numeric_mkrmwdza": evaluation["scores"].get("linguagem_corporal", 50),
+        "numeric_mkrme618": evaluation["scores"].get("tom_de_voz", 50),
+        "numeric_mkrm2988": evaluation["scores"].get("clareza_roteiro", 50),
+        "numeric_mkrmx949": evaluation["scores"].get("ritmo", 50),
+        "numeric_mkrmrtyq": evaluation["scores"].get("didatica", 50),
+        "numeric_mkrmvz8t": evaluation["scores"].get("qualidade_geral", 50),
+        "long_text_mkrmhbk8": suggestions_text.replace('"', '\\"') # Escape quaisquer aspas no texto da sugestão
+    }
+
+    column_values_string_for_graphql = json.dumps(column_values).replace('"', '\\"')
+
+    mutation_query = f"""
+        mutation {{
+            create_item (
+                board_id: {MONDAY_BOARD_ID},
+                item_name: "{item_name}",
+                column_values: "{column_values_string_for_graphql}"
+            ) {{
+                id
+                name
+            }}
+        }}
+    """
+    
+    data = {"query": mutation_query}
+
+    print("\n--- Request Headers para Monday.com ---")
+    print(headers)
+    print("\n--- Column Values (antes de serializar e escapar) ---")
+    print(json.dumps(column_values, indent=2))
+    print("\n--- Final GraphQL Query para Monday.com ---")
+    print(mutation_query)
+    print("------------------------------------------")
+
+    item_id = None # Inicializa item_id como None
+    try:
+        print(f"Enviando dados para o Monday.com para a aula '{item_name}'...")
+        response = requests.post(MONDAY_API_URL, headers=headers, json=data)
+        response.raise_for_status() 
+        
+        response_data = response.json()
+        if "data" in response_data and response_data["data"].get("create_item"):
+            item_id = response_data["data"]["create_item"]["id"]
+            print(f"Item criado com sucesso no Monday.com! ID: {item_id}")
+
+            # --- Lógica de upload de PDF ---
+            if pdf_path and os.path.exists(pdf_path):
+                print(f"Anexando PDF '{os.path.basename(pdf_path)}' ao item {item_id}...")
+                file_upload_url = "https://api.monday.com/v2/file"
+
+                mutation_upload_file = f"""
+                mutation addFileToColumn($file: File!) {{
+                  add_file_to_column (
+                    item_id: {item_id},
+                    column_id: "{MONDAY_FILES_COLUMN_ID}",
+                    file: $file
+                  ) {{
+                    id
+                  }}
+                }}
+                """
+                
+                file_map_json = json.dumps({"file": ["variables.file"]}) 
+                
+                files = {
+                    'query': (None, mutation_upload_file, 'application/json'), 
+                    'map': (None, file_map_json, 'application/json'),          
+                    'file': (os.path.basename(pdf_path), open(pdf_path, 'rb'), 'application/pdf') 
+                }
+
+                file_upload_headers = {
+                    "Authorization": f"{MONDAY_API_TOKEN}",
+                }
+
+                file_response = requests.post(file_upload_url, headers=file_upload_headers, files=files)
+                file_response.raise_for_status() 
+                
+                file_response_data = file_response.json()
+                if file_response_data.get('data') and file_response_data['data'].get('add_file_to_column'):
+                    file_id = file_response_data['data']['add_file_to_column']['id']
+                    print(f"PDF anexado à coluna de arquivos do item {item_id} com File ID: {file_id}")
+                else:
+                    print(f"Erro ao anexar o PDF: {json.dumps(file_response_data, indent=2)}")
+            else:
+                print("Caminho do PDF não fornecido ou arquivo PDF não encontrado. Não foi possível anexar ao Monday.com.")
+
+            return item_id 
+    
+        
+        else:
+            print(f"Erro ao criar item no Monday.com (resposta inesperada): {json.dumps(response_data, indent=2)}")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Erro de conexão ou API ao Monday.com: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Resposta da API (erro): {e.response.text}")
+        return None
+    except Exception as e:
+        print(f"Erro inesperado ao enviar para o Monday.com: {e}")
+        return None
+
+
+@app.route('/', methods=['GET'])
+def index():
+    return send_file('index.html')
+
+@app.route('/upload', methods=['POST'])
+def upload_video():
+    if 'video' not in request.files:
+        return jsonify({'error': 'Nenhum arquivo enviado'}), 400
+    
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'error': 'Nenhum arquivo selecionado'}), 400
+    
+    filename = secure_filename(file.filename)
+    video_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    if not os.path.exists(app.config['UPLOAD_FOLDER']):
+        os.makedirs(app.config['UPLOAD_FOLDER'])
+    file.save(video_path)
+    
+    transcription = transcribe_audio(video_path)
+    if not transcription:
+        return jsonify({'error': 'Falha na transcrição'}), 500
+    
+    movement_score = analyze_body_language(video_path)
+    evaluation = evaluate_lesson(transcription, movement_score)
+    pdf_path = generate_pdf_report(evaluation) # Gera o PDF primeiro
+    
+    # Enviar dados para o monday.com, AGORA PASSANDO O pdf_path
+    send_to_monday(evaluation, pdf_path) 
+    
+    if pdf_path and os.path.exists(pdf_path):
+        response = make_response(send_file(pdf_path, as_attachment=True, mimetype='application/pdf'))
+        response.headers['Content-Disposition'] = f'attachment; filename={os.path.basename(pdf_path)}'
+        return response
+    else:
+        return jsonify({'message': 'Avaliação concluída, mas PDF não gerado/encontrado.'}), 200
+
+if __name__ == '__main__':
+    # Cria a pasta de uploads se não existir
+    if not os.path.exists(app.config['UPLOAD_FOLDER']):
+        os.makedirs(app.config['UPLOAD_FOLDER'])
+    app.run(debug=True, host='0.0.0.0', port=5000)

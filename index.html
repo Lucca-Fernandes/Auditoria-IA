@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auditoria de Aula</title>
+    <!-- Google Fonts para fontes elegantes -->
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;500;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Poppins', sans-serif;
+            max-width: 100%;
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            color: #333;
+            overflow-x: hidden;
+            position: relative;
+        }
+
+        /* Efeito Parallax */
+        .parallax {
+            background: url('https://images.unsplash.com/photo-1522202176988-66273c2fd55f?ixlib=rb-4.0.3&auto=format&fit=crop&w=1350&q=80') no-repeat center center fixed;
+            background-size: cover;
+            height: 100vh;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            z-index: -1;
+            transform: translateZ(-1px) scale(1.5);
+        }
+
+        .content {
+            position: relative;
+            z-index: 1;
+            padding: 50px 20px;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .upload-section {
+            background: rgba(255, 255, 255, 0.9);
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+            animation: fadeIn 1s ease-in;
+        }
+
+        h2 {
+            font-size: 2.5em;
+            color: #2c3e50;
+            margin-bottom: 15px;
+            font-weight: 700;
+        }
+
+        p {
+            font-size: 1.1em;
+            color: #7f8c8d;
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }
+
+        input[type="file"] {
+            margin: 20px 0;
+            padding: 10px;
+            border: 2px dashed #3498db;
+            border-radius: 8px;
+            background: #fff;
+            width: 100%;
+            font-size: 1em;
+            color: #34495e;
+        }
+
+        button {
+            background: linear-gradient(90deg, #3498db, #8e44ad);
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: 500;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
+        }
+
+        #status {
+            margin-top: 20px;
+            color: #000000;
+            font-size: 1em;
+            animation: fadeIn 1s ease-in;
+        }
+
+        #downloadLink {
+            display: none;
+            margin-top: 20px;
+            text-decoration: none;
+            color: #27ae60;
+            font-weight: 500;
+            animation: fadeIn 1s ease-in;
+        }
+
+        #downloadLink:hover {
+            text-decoration: underline;
+        }
+
+        /* Animações */
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* Responsividade */
+        @media (max-width: 600px) {
+            .upload-section {
+                padding: 20px;
+            }
+            h2 {
+                font-size: 2em;
+            }
+            button {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="parallax"></div>
+    <div class="content">
+        <div class="upload-section">
+            <h2>Auditoria de Aula</h2>
+            <p>Faça upload de um vídeo de aula para análise e baixe o relatório gerado.</p>
+            <input type="file" id="videoUpload" accept="video/*">
+            <button onclick="uploadVideo()">Analisar e Gerar Relatório</button>
+            <div id="status"></div>
+            <a id="downloadLink" style="display: none;" href="/download-report" download="audit_report.pdf">Baixar Relatório (PDF)</a>
+        </div>
+    </div>
+
+    <script>
+        async function uploadVideo() {
+            const fileInput = document.getElementById('videoUpload');
+            const status = document.getElementById('status');
+            const downloadLink = document.getElementById('downloadLink');
+
+            if (!fileInput.files.length) {
+                status.textContent = 'Por favor, selecione um vídeo.';
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('video', fileInput.files[0]);
+
+            status.textContent = 'Processando vídeo...';
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    downloadLink.href = url;
+                    downloadLink.style.display = 'block';
+                    status.textContent = 'Relatório gerado com sucesso! Clique no link para baixar o PDF.';
+                    downloadLink.click(); // Forçar o download automático
+                } else {
+                    status.textContent = 'Erro ao processar o vídeo.';
+                }
+            } catch (error) {
+                status.textContent = 'Erro na comunicação com o servidor: ' + error.message;
+            }
+        }
+    </script>
+</body>
+</html>

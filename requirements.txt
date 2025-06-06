@@ -1,9 +1,0 @@
-opencv-python
-whisper
-librosa
-numpy
-spacy
-scikit-learn
-transformers
-sentence-transformers
-reportlab
