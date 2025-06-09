@@ -66,8 +66,8 @@ Sistema Operacional: Linux, macOS ou Windows (com FFmpeg configurado)
 ⚙️ Instalação
 
 Clone o repositório:
-git clone https://github.com/seu-usuario/auditoria-aula.git
-cd auditoria-aula
+git clone https://github.com/seu-usuario/Auditoria-IA.git
+cd Auditoria-IA
 
 
 Crie um ambiente virtual:
